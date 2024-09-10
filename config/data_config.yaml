@@ -1,0 +1,6 @@
+data_dir: 'dataset/citeseer-doc-classification'
+node_fname: 'citeseer.content'
+edge_fname: 'citeseer.cites'
+artefact_dir: 'artefacts'
+artefact_node_dct: 'doc2node.pkl'
+artefact_torch: 'torch_utils.pt'
