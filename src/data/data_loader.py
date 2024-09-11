@@ -1,104 +1,263 @@
-import os, argparse
+import os, torch, argparse
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
 # custom scripts
 from .utils import Node
 from ..utils import load_folder, dump_folder, Folder_Type
+from ..constants import ignore_class 
 # typing imports
-from typing import List
+from typing import Dict, List, Tuple
 
 
-class Data_Loader:
-
-	"""
-	This class is responsible in parsing the raw CITESEER dataset files into Node data structure
-	"""
-
-	def __init__(self, data_dir: str, node_fname: str, edge_fname: str, dump_path: str):
-		"""
-		:param data_dir   : path to directory having the dataset
-		:param node_fname : file name having node features
-		:param edge_fname : file name having node connections
-		:param dump_path  : path to dump artefacts to
-		"""
-		self.node_path = f'{data_dir}/{node_fname}'
-		self.edge_path = f'{data_dir}/{edge_fname}'
-		self.doc2node = {}
-		self.dump_path = dump_path
-		
-	def __parse_node_file(self) -> None:
-		"""
-		This function builds the nodes of the graphs and their corresponding features
-		"""
-		def parse_one_hot(one_hot_lst: List[str]) -> List[int]:
-			"""
-			:param one_hot_lst: a one-hot embedding of tokens per document
-			:returns : a list of indices that have a labeled token
-			"""
-			one_hot_lst = list(map(int, one_hot_lst))
-			# map each 1 in the hot embedding vector to its index
-			one_hot_lst = list(map(lambda x: x[0] if x[1] == 1 else - 1,enumerate(one_hot_lst)))
-			one_hot_lst = list(filter(lambda x: x>=0, one_hot_lst))
-			return one_hot_lst
-
-		# read folder
-		f_contents = load_folder(path_name=self.node_path, dtype=Folder_Type.text_f)
-
-		# parse contents
-		for line in f_contents:
-
-			doc_info = line.split()
-			# parse each line as in README file
-			doc_id, doc_feats, doc_label = doc_info[0], doc_info[1:-1], doc_info[-1]
-			# create new node and initialize its contents
-			self.doc2node[doc_id] = Node(feat_one_hot=parse_one_hot(one_hot_lst=doc_feats), 
-																	label=doc_label,
-																	connected_to=[doc_id]) 
-
-	def __parse_edge_file(self) -> None:
-		"""
-		This function stores per node the list of neighboring nodes it is connected to
-		"""
-		# read folder
-		f_contents = load_folder(path_name=self.edge_path, dtype=Folder_Type.text_f)
-		# parse contents
-		for line in f_contents:
-
-			# parse contents
-			edge_info = tuple(line.split())
-			en1, en2 = edge_info
-
-			# add undirected edges from each document to the other
-			if (en1 in self.doc2node) and (en2 in self.doc2node):
-				self.doc2node[en1].connected_to.append(en2)
-				self.doc2node[en2].connected_to.append(en1)
-
-	def generate_data_artefact(self):
-		"""
-		This function generates the dictionary mapping from document Id to all its features + 
-		connections with graph
-		"""
-		self.__parse_node_file()
-		self.__parse_edge_file()
-
-		dump_folder(path_name=self.dump_path, obj=self.doc2node, dtype=Folder_Type.pickle_f, is_bytes=True)
-
-
-def run_pipeline(path_conf: str) -> None:
-	"""
-	:param path_conf: path to data configuration folder
+class Label_Builder:
 	
-	This function reads both features and adjacency and dumps the graph to a folder
 	"""
-	data_conf = load_folder(path_name=path_conf, dtype=Folder_Type.yaml_f)
+	This class is responsible in parsing the labels of the different nodes
+	"""
+	def __init__(self, doc2node: Dict[str, Node], doc2id: Dict[str, int]):
+		"""
+		:param doc2node : map from each document name to its corresponding node features/labels/connections
+		:param doc2id   : map from document Id to its corresponding row in any tensor
+		"""
+		self.encoder = LabelEncoder()
+		self.labels = self.__extract_labels(doc2node=doc2node, doc2id=doc2id)
+		self.__map_labels()
+		self.__donwsample_labels()
 
-	if not os.path.exists(data_conf['artefact_dir']):
-		os.mkdir(data_conf['artefact_dir'])
+	def __extract_labels(self, doc2node: Dict[str, Node], doc2id: Dict[str, int]) -> List[str]:
+		"""
+		:param doc2node : map from each document name to its corresponding node features/labels/connections
+		:param doc2id   : map from document Id to its corresponding row in any tensor
+		:returns: a list of labels per document
 
+		This function extracts labels per Node
+		"""
+		label_vec = [None] * len(doc2node)
+
+		for doc_id, doc_node in doc2node.items():
+			
+			doc_row_idx = doc2id[doc_id]
+			label_vec[doc_row_idx] = doc_node.label
+
+		return label_vec
+
+	def __map_labels(self) -> None:
+		"""
+		This function maps the labels from strings to integers
+		"""
+		self.labels = self.encoder.fit_transform(self.labels)
+
+	def __donwsample_labels(self, nsamp_pcls: int=60) -> None:
+		"""
+		:param nsamp_cls: number of samples per class
+
+		This function as within the GCN paper keeps 20 samples per class
+		"""
+		unique_cls = np.unique(self.labels)
+		for cls_ in unique_cls:
+			# find labels of current class
+			indices = np.where(self.labels == cls_)[0]
+			# randomly select all indices except of those of the k samples
+			indices = np.random.choice(indices, size=indices.shape[0] - nsamp_pcls, replace=False)
+			# unlabel those samples
+			self.labels[indices] = ignore_class
+
+	def get_labels(self) -> torch.Tensor:
+		"""
+		:returns: a tensor with all labels per node
+		"""
+		return torch.from_numpy(self.labels).to(torch.long)
+
+
+class Feat_Builder:
 	
-	loader = Data_Loader(data_dir=data_conf['data_dir'], node_fname=data_conf['node_fname'],\
-						 edge_fname=data_conf['edge_fname'], 
-						 dump_path=f"{data_conf['artefact_dir']}/{data_conf['artefact_node_dct']}")
+	"""
+	This class builds the feature matrix out of the node class
+	"""
+	def __init__(self, doc2node: Dict[str, Node], doc2id: Dict[str, int]):
+		"""
+		:param doc2node : map from each document name to its corresponding node features/labels/connections
+		:param doc2id   : map from document Id to its corresponding row in any tensor
+		"""
+		self.X = self.__build_matrix(doc2node=doc2node, doc2id=doc2id)
 
-	loader.generate_data_artefact()
+	def __find_feat_dim(self, doc2node: Dict[str, Node]):
+		"""
+		:param doc2node : map from each document name to its corresponding node features/labels/connections
+		:returns : the dimension of the feature matrix
+		"""
+		dim = -1
+
+		for doc_id, doc_node in doc2node.items():
+
+			# extract indices of 1's of one hot feature encoding of tokens
+			row_idx_lst = doc_node.feat_one_hot
+			# extract maximum dimension
+			dim = max(dim, max(row_idx_lst))
+
+		dim += 1
+		return dim
+
+	def __build_matrix(self, doc2node: Dict[str, Node], doc2id: Dict[str, int]):
+		"""
+		:param doc2node : map from each document name to its corresponding node features/labels/connections
+		:param doc2id   : map from document Id to its corresponding row in any tensor
+
+		This function builds up the feature matrix
+		"""
+
+		dim = self.__find_feat_dim(doc2node=doc2node)
+
+		X = []
+		for doc_id, doc_node in doc2node.items():
+
+			# extract indices of 1's of one hot feature encoding of tokens
+			row_idx_lst = torch.tensor(doc_node.feat_one_hot, dtype=torch.int)
+			# build feature vector
+			f_vec = torch.zeros(size=(1, dim))
+			f_vec[:, row_idx_lst] = 1
+			# get row index of document
+			X.append(f_vec)
+
+		X = torch.vstack(X)
+		return X
+
+	def get_feat_matrix(self) -> torch.Tensor:
+		return self.X
+
+
+class Neighbor_Builder:
+
+	"""
+	This class builds a data structure having the one-hop neighborhoods of each node in our graph
+	"""
+	def __init__(self, doc2node: Dict[str, Node], doc2id: Dict[str, int]):
+		"""
+		:param doc2node : map from each document name to its corresponding node features/labels/connections
+		:param doc2id   : map from document Id to its corresponding row in any tensor
+		"""
+		self.ngbr_lst = self.__build_lst(doc2node=doc2node, doc2id=doc2id)
+
+	def __build_lst(self, doc2node: Dict[str, Node], doc2id: Dict[str, int]) -> List[List[int]]:
+		"""
+		:param doc2node : map from each document name to its corresponding node features/labels/connections
+		:param doc2id   : map from document Id to its corresponding row in any tensor
+		:returns: a list of list having the one hop neighborhood of each node in our dataset
+		"""
+
+		lst = [None] * len(doc2node)
+
+		for doc_id, doc_node in doc2node.items():
+
+			# extract neighboring documents
+			neighborhood = list(map(lambda neighbor_id: doc2id[neighbor_id], doc_node.connected_to))
+			
+			# place the neighborhood in its correct position
+			doc_pos = doc2id[doc_id]
+			lst[doc_pos] = neighborhood
+
+		return lst
+
+	def get_onehop_lst(self) -> List[List[int]]:
+		return self.ngbr_lst
+
+
+def build_doc2id_mapper(doc2node: Dict[str, Node]) -> Dict[str, int]:
+	"""
+	:param doc2node: a dicitionary mapping each document Id to the corresponding Node
+	:returns: a dictionary mapping from row Id in matrix to the document Id
+	"""
+	doc2id = {}
+	for idx, k in enumerate(doc2node.keys()):
+		doc2id[k] = idx
+	return doc2id
+
+
+def generate_inference_masks(label_tens: torch.Tensor, mask_tens:torch.Tensor=None, 
+							 num_inf_samp:int=20) -> Tuple[torch.Tensor, torch.Tensor]:
+	"""
+	:param label_tens : tensor having labels per node in graph
+	:param mask_tens  : indices of samples to be excluded from consideration
+	:param split_size : the size of the inference split
+	:returns: the indices of train and inference splits
+	"""
+	# extract classes in the dataset
+	unique_cls = torch.unique(label_tens)
+	unique_cls = unique_cls[unique_cls != ignore_class]
+
+	train_lst, test_lst = [], []
+
+	for target_class in unique_cls:
+
+		# keep nodes that have this class label
+		marked_nodes_idx = torch.argwhere(label_tens == target_class).squeeze()
+
+		# mask out nodes that need to be excluded
+		if mask_tens is not None:
+			bool_mask = torch.isin(marked_nodes_idx, mask_tens)
+			marked_nodes_idx = marked_nodes_idx[~bool_mask]
+
+		# generate a range from 0 till length of labeled nodes
+		num_marked_nodes = marked_nodes_idx.shape[0]
+		marked_range = torch.randperm(num_marked_nodes)
+
+		# split into train and test indices
+		train_idx, test_idx = marked_range[num_inf_samp:], marked_range[:num_inf_samp]
+		# keep the train and validation indices in the main tensor
+		train_nodes, test_nodes = marked_nodes_idx[train_idx] , marked_nodes_idx[test_idx]
+
+		train_lst.append(train_nodes)
+		test_lst.append(test_nodes)
+
+	# concatenate the indices across all classess
+	train_nodes = torch.cat(train_lst, axis=0)
+	test_nodes  = torch.cat(test_lst, axis=0)
+
+	# shuffle the tensors
+	train_nodes = train_nodes[torch.randperm(train_nodes.shape[0])]
+	test_nodes  = test_nodes[torch.randperm(test_nodes.shape[0])]
+
+	return train_nodes, test_nodes
+
+
+def run_pipeline(data_conf_path: str) -> None:
+	"""
+	:param data_conf_path: path having configuration of all data related folders
+
+	This function iterates the generation of all data related components => 
+	features/adjacency/degree/train-val-test splits
+	"""
+	
+	# read path with configurations
+	data_conf = load_folder(path_name=data_conf_path, dtype=Folder_Type.yaml_f)
+
+	# load map from document Id to Node class
+	doc2node = load_folder(path_name=f"{data_conf['artefact_dir']}/{data_conf['artefact_node_dct']}",\
+						   dtype=Folder_Type.pickle_f, is_bytes=True)
+
+	# generate a map to link each document Id to an index number used to represent this node in the graph later
+	id2doc = build_doc2id_mapper(doc2node=doc2node)
+
+	# geneate features, adjacency list and labels
+	gt_builder = Label_Builder(doc2node=doc2node, doc2id=id2doc)
+	label_tens = gt_builder.get_labels()
+
+	ft_builder = Feat_Builder(doc2node=doc2node, doc2id=id2doc)
+	X_tens = ft_builder.get_feat_matrix()
+
+	al_builder = Neighbor_Builder(doc2node=doc2node, doc2id=id2doc)
+	ngbr_lst = al_builder.get_onehop_lst()
+	
+	# generate tensors having nodes for train/val/test splits
+	train_nodes, test_nodes = generate_inference_masks(label_tens=label_tens)
+	train_nodes, val_nodes  = generate_inference_masks(label_tens=label_tens, mask_tens=test_nodes)
+
+	artefacts = {'feats': X_tens, 'adjacency_lst': ngbr_lst, 'label': label_tens, 
+				 'train_split': (train_nodes, val_nodes), 'test_split': test_nodes}
+
+	dump_folder(path_name=f"{data_conf['artefact_dir']}/{data_conf['artefact_torch']}",
+				obj=artefacts, dtype=Folder_Type.torch_f, is_bytes=True)
+
 
 
 if __name__ == '__main__':
@@ -107,5 +266,4 @@ if __name__ == '__main__':
 	parser.add_argument('--conf_path', type=str, help='Path having data configuration')
 	args = parser.parse_args()
 
-	run_pipeline(path_conf=args.conf_path)
-	
+	run_pipeline(data_conf_path=args.conf_path)
